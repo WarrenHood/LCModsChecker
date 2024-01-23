@@ -140,8 +140,9 @@ def get_scan_exclusions():
     with open(exclusions_file, "r") as f:
         for ln in f:
             exclusion = ln.strip()
-            if exclusion.startswith("#") or len(exclusions) == 0:
+            if exclusion.startswith("#") or len(exclusion) == 0:
                 continue
+            logging.debug(f"Found exclusion '{exclusion}'")
             exclusions.append(exclusion)
     return exclusions
 
