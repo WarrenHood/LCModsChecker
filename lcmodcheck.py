@@ -19,10 +19,13 @@ class LCMod:
     name: str
     author: str
     url: str
+    dlls: list[str]
     source_url: Optional[str]
 
     def __repr__(self) -> str:
-        return f"{self.name} by {self.author} ({self.url}, {self.source_url})"
+        return f"\nMod: {self.name} by {self.author}\nMod page: {self.url}\nGithub repo:{self.source_url}\nDLLs:\n  {{}}".format(
+            "\n  ".join(self.dlls)
+        )
 
 
 def get_mods(mods_file: str) -> list[LCMod]:
@@ -42,12 +45,17 @@ def get_mods(mods_file: str) -> list[LCMod]:
             continue
         if mod_name in exclusions:
             continue
-        if mod_has_dlls(profile_dir, mod_name):
-            mod = LCMod(name=mod_name, author=mod_author, url=mod_url, source_url=None)
-            logging.info(f"Detected DLLs in mod: {mod}")
-            mods.append(
-                LCMod(name=mod_name, author=mod_author, url=mod_url, source_url=None)
+        mod_dlls = get_mod_dlls(profile_dir, mod_name)
+        if len(mod_dlls) > 0:
+            mod = LCMod(
+                name=mod_name,
+                author=mod_author,
+                url=mod_url,
+                source_url=None,
+                dlls=mod_dlls,
             )
+            logging.info(f"Detected {len(mod_dlls)} DLLs in mod {mod.name}")
+            mods.append(mod)
     return mods
 
 
@@ -57,6 +65,9 @@ async def gather_tasks_in_batches(
     results = []
     for i in range(0, len(tasks), batch_size):
         results += await asyncio.gather(*tasks[i : i + batch_size])
+        logging.info(
+            f"Progress: {float(min(i+batch_size, len(tasks)))/float(len(tasks))*100.0:<.2f}% ({min(i+batch_size, len(tasks))}/{len(tasks)})"
+        )
         await asyncio.sleep(delay)
     return results
 
@@ -94,6 +105,7 @@ async def populate_mod_url(mod: LCMod, session: aiohttp.ClientSession) -> LCMod:
                             name=mod.name,
                             author=mod.author,
                             url=mod.url,
+                            dlls=mod.dlls,
                             source_url=url,
                         )
     except Exception as e:
@@ -101,7 +113,7 @@ async def populate_mod_url(mod: LCMod, session: aiohttp.ClientSession) -> LCMod:
     return mod
 
 
-def mod_has_dlls(profile_dir: str, mod_name: str) -> bool:
+def get_mod_dlls(profile_dir: str, mod_name: str) -> list[str]:
     """
     Given an r2modman profile path, and a mod name, returns whether the mod has DLLs
     """
@@ -110,7 +122,7 @@ def mod_has_dlls(profile_dir: str, mod_name: str) -> bool:
         raise Exception(
             f"Mod {mod_name} is missing from your r2modman profile. Please ensure it is installed"
         )
-    return len(list(Path(mod_dir).glob("**/*.dll"))) > 0
+    return list(map(str, Path(mod_dir).glob("**/*.dll")))
 
 
 async def populate_mod_urls(mods: list[LCMod]) -> list[LCMod]:
