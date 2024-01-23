@@ -1,0 +1,2 @@
+# Enter the name of each mod to exclude from scanning on their own lines below
+BepInEx-BepInExPack
