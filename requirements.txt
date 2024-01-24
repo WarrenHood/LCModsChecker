@@ -2,3 +2,4 @@ pyyaml
 asyncio
 aiohttp
 aiodns
+vt-py

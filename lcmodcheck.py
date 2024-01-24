@@ -1,3 +1,4 @@
+from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import re
@@ -9,9 +10,111 @@ import logging
 import asyncio
 import aiohttp
 from pathlib import Path
+import vt
+import time
+import hashlib
+import datetime
+import traceback
 
 GITHUB_RE = re.compile(r'\bhttps://github\.com/[^\'"]+\b', re.IGNORECASE)
 GITHUB_BLACKLISTED_URLS = ["https://github.com/thunderstore-io/Thunderstore"]
+VT_OKAY_CATEGORIES = ["undetected", "harmless", "type-unsupported"]
+VT_SCAN_FRESH_DAYS = 30  # Time since last scan before a new vt upload is required
+
+
+@dataclass
+class EngineDetection:
+    engine: str
+    detection: str
+    category: str
+
+    def __repr__(self) -> str:
+        return f"{self.engine} ({self.detection})"
+
+    def is_okay(self) -> bool:
+        okay = True
+
+        # Ensure that the category is in one of the OKAY categories
+        okay = okay and self.category in VT_OKAY_CATEGORIES
+
+        return okay
+
+
+@dataclass
+class AVScanSummary:
+    category: str
+    detections: list[EngineDetection]
+
+    @staticmethod
+    def from_results(results: dict) -> list[AVScanSummary]:
+        categories = {}
+        for engine, result in results.items():
+            category = result.get("category", "UNKNOWN CATEGORY")
+            engine_result = EngineDetection(
+                engine=engine,
+                detection=result.get("result", "UNKNOWN RESULT"),
+                category=category,
+            )
+            categories.setdefault(category, []).append(engine_result)
+        output = []
+        for category, engine_detections in categories.items():
+            output.append(
+                AVScanSummary(category=category, detections=engine_detections)
+            )
+        return output
+
+    def filtered(self) -> AVScanSummary:
+        """
+        Returns a copy of the `AVScanSummary` with okay detections filtered out
+        """
+        return AVScanSummary(
+            category=self.category,
+            detections=[d for d in self.detections if not d.is_okay()],
+        )
+
+    def is_okay(self) -> bool:
+        """
+        Returns `True` if there are no detections for this category
+        """
+        return len(self.detections) == 0
+
+    def __repr__(self) -> str:
+        return f"Detected as {self.category.upper()} by {len(self.detections)} engines:\n  - {{}}\n-------------------------------".format(
+            "\n  - ".join(map(str, self.detections))
+        )
+
+
+@dataclass
+class AVScanSummaries:
+    summaries: list[AVScanSummary]
+
+    @staticmethod
+    def from_results(results: dict) -> AVScanSummaries:
+        return AVScanSummaries(summaries=AVScanSummary.from_results(results))
+
+    def filtered(self):
+        return AVScanSummaries(summaries=[s.filtered() for s in self.summaries])
+
+    def is_ok(self):
+        """
+        Returns whether or not the scanned file has any detections
+        """
+        for summary in self.summaries:
+            if not summary.is_okay():
+                return False
+        return True
+
+    def __repr__(self) -> str:
+        return "\n".join(
+            map(
+                str,
+                (
+                    s
+                    for s in sorted(self.summaries, key=lambda s: s.category)
+                    if not s.is_okay()
+                ),
+            )
+        )
 
 
 @dataclass
@@ -26,6 +129,103 @@ class LCMod:
         return f"\nMod: {self.name} by {self.author}\nMod page: {self.url}\nGithub repo:{self.source_url}\nDLLs:\n  {{}}".format(
             "\n  ".join(self.dlls)
         )
+
+    async def get_mock_dll_anal(self, vt_client: vt.Client, dll: str) -> dict:
+        """
+        Returns fake analysis of a given DLL
+        """
+        stats = {}
+        results = {
+            "MockAV 1": {"category": "malicious", "result": "MockResult-Malicious"},
+            "MockAV 2": {"category": "harmless", "result": "MockResult-Harmless"},
+            "MockAV 3": {"category": "suspicious", "result": "MockResult-Sussy"},
+            "MockAV 4": {"category": "suspicious", "result": "MockResult-SussyBaka"},
+        }
+        return {
+            "attributes": {
+                "stats": stats,
+                "results": results,
+            }
+        }
+
+    async def get_dll_anal(self, vt_client: vt.Client, dll: str) -> dict:
+        """
+        Attempts to get the latest analysis of a given DLL based on md5 hash, otherwise uploads the file to VirusTotal.
+        """
+        with open(dll, "rb") as f:
+            md5 = hashlib.md5(f.read()).hexdigest()
+
+        anal = None
+        try:
+            vt_file = await vt_client.get_object_async(f"/files/{md5}")
+        except vt.error.APIError as e:
+            logging.error(f"Got an API Error while getting anal: {e}")
+            vt_file = {}
+        last_anal_results = vt_file.get("last_analysis_results")
+        last_anal_stats = vt_file.get("last_analysis_stats")
+        if last_anal_results is not None and last_anal_stats is not None:
+            last_scan_date = datetime.datetime.utcfromtimestamp(
+                vt_file.get("last_analysis_date", 0)
+            )
+            days_since_last_scan = (datetime.datetime.utcnow() - last_scan_date).days
+            if days_since_last_scan <= VT_SCAN_FRESH_DAYS:
+                logging.debug(
+                    f"It has been {days_since_last_scan} days since the last scan. Reusing last analysis..."
+                )
+                anal = {
+                    "attributes": {
+                        "stats": last_anal_stats,
+                        "results": last_anal_results,
+                    }
+                }
+            else:
+                logging.warning(
+                    f"It has been {days_since_last_scan} days since the last scan. Reuploading..."
+                )
+        else:
+            logging.info(
+                "File hasn't ever been scanned before. Uploading to VirusTotal for scan..."
+            )
+        if anal is None:
+            with open(dll, "rb") as f:
+                anal = (
+                    await vt_client.scan_file_async(f, wait_for_completion=True)
+                ).to_dict()
+        return anal
+
+    async def av_scan(self, vt_client: vt.Client, delay=15.0) -> None:
+        """
+        Gets a VirusTotal analysis of the dll, and prints the results
+        """
+        for dll in self.dlls:
+            last_scan_time = datetime.datetime.now()
+            try:
+                if not os.path.exists(dll):
+                    logging.error(
+                        f"[{self.name}] DLL {dll} appears to be missing. Unable to run AV scan on it."
+                    )
+                    continue
+                logging.info(f"Running AV scan on {dll}")
+                with open(dll, "rb") as f:
+                    anal = await self.get_dll_anal(vt_client, dll)
+                    # anal = await self.get_mock_dll_anal(vt_client, dll)
+                    self.print_anal(dll, anal)
+                logging.debug(f"Waiting for {delay} seconds")
+            except Exception:
+                logging.error(f"Failed to scan {dll}:\n{traceback.format_exc()}")
+            seconds_since_last_scan = (datetime.datetime.now() - last_scan_time).seconds
+            if seconds_since_last_scan < delay:
+                # Ensure we don't go faster than 1 scan every 15 seconds (4 scans per minute)
+                await asyncio.sleep(delay - seconds_since_last_scan)
+
+    def print_anal(self, dll: str, stats: dict) -> None:
+        logging.debug(f"VirusTotal analysis for DLL: {dll}")
+        logging.debug(str(stats))
+        results = stats.get("attributes", {}).get("results", {})
+        av_result = AVScanSummaries.from_results(results).filtered()
+        if not av_result.is_ok():
+            print(f"Unsafe dll detected: {dll}")
+            print(av_result)
 
 
 def get_mods(mods_file: str) -> list[LCMod]:
@@ -44,6 +244,7 @@ def get_mods(mods_file: str) -> list[LCMod]:
             )
             continue
         if mod_name in exclusions:
+            logging.debug(f"Skipping mod {mod_name} - present in scan_exclusions.txt")
             continue
         mod_dlls = get_mod_dlls(profile_dir, mod_name)
         if len(mod_dlls) > 0:
@@ -173,6 +374,22 @@ async def main():
         const=logging.DEBUG,
         default=logging.INFO,
     )
+    parser.add_argument(
+        "-a",
+        "--av-scan",
+        help="Run VirusTotal scan on all DLLs",
+        dest="api_key",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "-ad",
+        "--av-scan-delay",
+        help="Minimum delay (in seconds) between VirusTotal scans",
+        dest="av_scan_delay",
+        type=float,
+        default=15.0,
+    )
     args = parser.parse_args()
     logging.getLogger().setLevel(args.log_level)
 
@@ -182,7 +399,7 @@ async def main():
 
     mods = get_mods(args.modlist)
 
-    logging.info(f"About to scan {len(mods)} mods")
+    logging.info(f"Scanning {len(mods)} mods...")
     logging.debug(f"Mods to scan:")
     for mod in mods:
         logging.debug(f"  {mod}")
@@ -194,6 +411,12 @@ async def main():
     for mod in mods:
         if mod.source_url is None:
             print(f"{mod}")
+
+    if args.api_key:
+        logging.info("Beginning AV scans...")
+        async with vt.Client(args.api_key) as vt_client:
+            for mod in mods:
+                await mod.av_scan(vt_client, delay=args.av_scan_delay)
 
 
 if __name__ == "__main__":
